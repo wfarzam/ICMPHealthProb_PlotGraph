@@ -4,53 +4,65 @@ import platform
 import subprocess
 import time
 import math
-from typing import Dict, Tuple
 import re
 import socket
+from typing import Dict, Tuple, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import matplotlib.pyplot as plt
 import paramiko
-from paramiko.ssh_exception import AuthenticationException, SSHException, NoValidConnectionsError, BadHostKeyException
+from paramiko.ssh_exception import (
+    AuthenticationException, SSHException, NoValidConnectionsError, BadHostKeyException
+)
 
-# --- SSH auth ---
+# ---------- Auth / SSH ----------
 USERNAME = "admin"
-PASSWORDS = ["cisco", "Admin123"]     # try in order
-SSH_TIMEOUT = 3.0                        # seconds
-HOSTNAME_REFRESH_SEC = 120               # cache refresh
+PASSWORDS = ["cisco", "Admin123"]
+SSH_TIMEOUT = 3.0
+HOSTNAME_REFRESH_SEC = 120
 
-# --- Visual layout ---
-RADIUS = 1.0
+# ---------- Visuals / Layout ----------
+RADIUS = 1.3                 # bigger circle so UP/DOWN fits cleanly
 LABEL_FS = 10
 STATUS_FS = 12
 COLS = 7
 
-# --- Blink settings ---
-BLINK_PERIOD_SEC = 1.0   # full on <-> dim every 1s
+# ---------- Blinking ----------
+BLINK_PERIOD_SEC = 1.0       # toggle every 1s
 DIM_ALPHA = 0.25
 FULL_ALPHA = 1.0
+
+# ---------- Domain suffixes to strip from hostnames (case-insensitive) ----------
+SUFFIXES = (".elements.local", ".intel.com", ".corp.nandps.com")
+
+# ---------- Caches ----------
+_hostname_cache: Dict[str, Tuple[str, float]] = {}
+
+# ---------- Helpers ----------
+def clean_hostname(hn: str) -> str:
+    if not hn:
+        return "unknown"
+    h = hn.strip()
+    h_lower = h.lower()
+    for sfx in SUFFIXES:
+        if h_lower.endswith(sfx):
+            h = h[: -(len(sfx))]
+            break
+    return h if h else "unknown"
 
 def ping_device(ip: str) -> bool:
     system = platform.system().lower()
     if system == "windows":
-        cmd = ["ping", "-n", "1", "-w", "1000", ip]  # 1s timeout
+        cmd = ["ping", "-n", "1", "-w", "1000", ip]
     else:
-        cmd = ["ping", "-c", "1", "-W", "1", ip]     # 1s timeout
+        cmd = ["ping", "-c", "1", "-W", "1", ip]
     try:
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return res.returncode == 0
     except Exception:
         return False
 
-def read_devices(file_path="devices.txt"):
-    try:
-        with open(file_path, "r") as f:
-            return [line.strip() for line in f if line.strip()]
-    except FileNotFoundError:
-        print(f"[!] {file_path} not found.")
-        return []
-
 def ssh_exec_once(ip: str, command: str) -> Tuple[bool, str]:
-    """Try SSH with each password; return (ok, output)."""
     for pwd in PASSWORDS:
         client = None
         try:
@@ -69,8 +81,8 @@ def ssh_exec_once(ip: str, command: str) -> Tuple[bool, str]:
             stdin, stdout, stderr = client.exec_command(command, timeout=SSH_TIMEOUT)
             out = stdout.read().decode(errors="ignore").strip()
             return True, out
-        except (AuthenticationException, BadHostKeyException, SSHException, NoValidConnectionsError, socket.error, socket.timeout):
-            # try next password
+        except (AuthenticationException, BadHostKeyException, SSHException,
+                NoValidConnectionsError, socket.error, socket.timeout):
             pass
         except Exception:
             pass
@@ -83,7 +95,6 @@ def ssh_exec_once(ip: str, command: str) -> Tuple[bool, str]:
     return False, ""
 
 def parse_iosxe_hostname(output: str) -> str:
-    # looks for lines like "hostname NAME"
     for line in output.splitlines():
         m = re.search(r'^\s*hostname\s+([A-Za-z0-9._\-]+)\s*$', line)
         if m:
@@ -91,24 +102,18 @@ def parse_iosxe_hostname(output: str) -> str:
     return ""
 
 def get_hostname_via_ssh(ip: str) -> str:
-    """
-    Try NX-OS first, then IOS-XE. Return 'unknown' on failure.
-    """
-    # NX-OS (usually returns just the hostname or "Hostname: <name>")
+    # NX-OS
     ok, out = ssh_exec_once(ip, "show hostname")
     if ok and out:
         lines = [l.strip() for l in out.splitlines() if l.strip()]
-        # 1-liner hostname or "Hostname: NAME" or a token line
         for l in lines:
             m = re.search(r'Hostname\s*:\s*([A-Za-z0-9._\-]+)', l, flags=re.IGNORECASE)
             if m:
                 return m.group(1)
-        if len(lines) == 1:
-            tok = lines[0]
-            if re.match(r'^[A-Za-z0-9._\-]+$', tok):
-                return tok
+        if len(lines) == 1 and re.match(r'^[A-Za-z0-9._\-]+$', lines[0]):
+            return lines[0]
 
-    # IOS-XE — use include to avoid pagination
+    # IOS-XE
     ok, out = ssh_exec_once(ip, "show running-config | include ^hostname")
     if ok and out:
         hn = parse_iosxe_hostname(out)
@@ -117,21 +122,27 @@ def get_hostname_via_ssh(ip: str) -> str:
 
     return "unknown"
 
-# cache: ip -> (hostname, timestamp)
-_hostname_cache: Dict[str, Tuple[str, float]] = {}
-
 def get_hostname_cached(ip: str, should_try_ssh: bool) -> str:
     now = time.time()
     if ip in _hostname_cache:
         hn, ts = _hostname_cache[ip]
         if now - ts < HOSTNAME_REFRESH_SEC:
             return hn
+
+    hn = "unknown"
     if should_try_ssh:
         hn = get_hostname_via_ssh(ip)
-    else:
-        hn = "unknown"
+
     _hostname_cache[ip] = (hn, now)
     return hn
+
+def read_devices(file_path="devices.txt") -> List[str]:
+    try:
+        with open(file_path, "r") as f:
+            return [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        print(f"[!] {file_path} not found.")
+        return []
 
 def compute_grid_positions(n, cols, x_gap, y_gap):
     rows = math.ceil(n / cols) if cols else 1
@@ -151,38 +162,29 @@ def compute_grid_positions(n, cols, x_gap, y_gap):
         positions = [(x + x_offset, y + y_offset) for (x, y) in positions]
     return positions, rows
 
-def draw_health_map(devices, statuses, hostnames, ax, t_now):
-    """
-    statuses: list[bool] (True = UP, False = DOWN)
-    hostnames: dict[ip] -> str
-    t_now: time.time() for blinking
-    """
+# ---------- Drawing ----------
+def draw_health_map(devices, statuses, hostnames, ax, blink_on: bool):
     ax.clear()
     ax.set_facecolor("black")
     ax.axis("off")
     ax.set_aspect("equal", adjustable="box")
 
-    # spacing based on longest label (hostname or IP)
+    # spacing based on cleaned hostname length + IP length
     longest = 12
     for ip in devices:
-        hn = hostnames.get(ip, "unknown")
+        hn = clean_hostname(hostnames.get(ip, "unknown"))
         longest = max(longest, len(hn), len(ip))
-    X_GAP_MIN = 3.6
-    X_GAP = max(X_GAP_MIN, 0.34 * longest + 1.6)
-    Y_GAP = 4.2
+
+    X_GAP_MIN = 3.8
+    X_GAP = max(X_GAP_MIN, 0.35 * longest + 1.6)
+    Y_GAP = 4.4
 
     positions, rows = compute_grid_positions(len(devices), COLS, X_GAP, Y_GAP)
 
-    # blink phase toggles roughly every BLINK_PERIOD_SEC
-    phase_on = int(t_now // BLINK_PERIOD_SEC) % 2 == 0
-
     for (ip, up), (x, y) in zip(zip(devices, statuses), positions):
-        hostname = hostnames.get(ip, "unknown")
+        hn_clean = clean_hostname(hostnames.get(ip, "unknown"))
 
-        if up:
-            alpha = FULL_ALPHA
-        else:
-            alpha = FULL_ALPHA if phase_on else DIM_ALPHA
+        alpha = FULL_ALPHA if up else (FULL_ALPHA if blink_on else DIM_ALPHA)
 
         face_color = "green" if up else "red"
         status_text = "UP" if up else "DOWN"
@@ -192,28 +194,71 @@ def draw_health_map(devices, statuses, hostnames, ax, t_now):
                           linewidth=1.8, antialiased=True, alpha=alpha)
         ax.add_patch(circ)
 
-        # UP/DOWN text inside circle
         ax.text(x, y, status_text, color=status_color, ha="center", va="center",
                 fontsize=STATUS_FS, fontweight="bold", alpha=alpha)
 
-        # Hostname + IP badge (always shown)
-        label_text = f"{hostname}\n{ip}"
+        label_text = f"{hn_clean}\n{ip}"
         ax.text(x, y - (RADIUS + 0.9), label_text,
                 color="black", ha="center", va="center",
                 fontsize=LABEL_FS, fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="none", alpha=1.0))
 
-    # limits
     if devices:
         width = max(1, (COLS - 1)) * X_GAP
         height = max(1, (rows - 1)) * Y_GAP
         pad_x = 2.0
         pad_y = 2.0
         ax.set_xlim(-width/2 - pad_x, width/2 + pad_x)
-        ax.set_ylim(-height/2 - (RADIUS + 1.6) - pad_y, height/2 + (RADIUS + 1.6) + pad_y)
+        ax.set_ylim(-height/2 - (RADIUS + 1.8) - pad_y, height/2 + (RADIUS + 1.8) + pad_y)
 
     ax.set_title("Live Network Device Health", color="white", fontsize=16, fontweight="bold", pad=16)
 
+# ---------- Concurrency Wrappers ----------
+def concurrent_ping(devices: List[str]) -> Dict[str, bool]:
+    results: Dict[str, bool] = {}
+    with ThreadPoolExecutor(max_workers=min(32, len(devices) or 1)) as ex:
+        fut_map = {ex.submit(ping_device, ip): ip for ip in devices}
+        for fut in as_completed(fut_map):
+            ip = fut_map[fut]
+            try:
+                results[ip] = fut.result()
+            except Exception:
+                results[ip] = False
+    return results
+
+def concurrent_hostname_refresh(devices_up: List[str]) -> Dict[str, str]:
+    """
+    Refresh hostname cache concurrently only for devices whose cache is stale.
+    Returns dict[ip] -> hostname (from cache after refresh).
+    """
+    now = time.time()
+    to_refresh = []
+    for ip in devices_up:
+        if ip not in _hostname_cache or now - _hostname_cache[ip][1] >= HOSTNAME_REFRESH_SEC:
+            to_refresh.append(ip)
+
+    # fetch in parallel
+    def fetch(ip):
+        hn = get_hostname_via_ssh(ip)
+        _hostname_cache[ip] = (hn, time.time())
+        return ip, hn
+
+    with ThreadPoolExecutor(max_workers=min(16, len(to_refresh) or 1)) as ex:
+        futs = [ex.submit(fetch, ip) for ip in to_refresh]
+        for fut in as_completed(futs):
+            try:
+                ip, _ = fut.result()
+            except Exception:
+                pass
+
+    # build final map from cache
+    out = {}
+    for ip in devices_up:
+        hn, ts = _hostname_cache.get(ip, ("unknown", now))
+        out[ip] = hn
+    return out
+
+# ---------- Main ----------
 def main():
     devices = read_devices("devices.txt")
     if not devices:
@@ -224,30 +269,52 @@ def main():
     plt.ion()
     plt.show()
 
-    print("[*] Live device health monitoring (Ctrl + C to stop)")
-    print("[i] Will try SSH for hostname only on devices that are UP.")
+    print("[*] Live monitoring (Ctrl+C to stop). Blinking = DOWN nodes.")
+    print("[i] Hostnames pulled over SSH for UP nodes; cache refresh every "
+          f"{HOSTNAME_REFRESH_SEC}s.")
+
+    last_blink_toggle = time.time()
+    blink_on = True
 
     try:
-        # refresh faster to make blinking obvious
         while True:
-            t_now = time.time()
-            statuses = [ping_device(ip) for ip in devices]
+            # toggle blink state every BLINK_PERIOD_SEC
+            now = time.time()
+            if now - last_blink_toggle >= BLINK_PERIOD_SEC:
+                blink_on = not blink_on
+                last_blink_toggle = now
 
-            # fetch (or reuse) hostnames; only try SSH for UP devices
-            hostnames = {ip: get_hostname_cached(ip, should_try_ssh=up) for ip, up in zip(devices, statuses)}
+            # ping concurrently
+            ping_map = concurrent_ping(devices)
+            statuses = [ping_map.get(ip, False) for ip in devices]
 
-            # console output
-            os.system('cls' if platform.system().lower() == 'windows' else 'clear')
-            print("Network Device Health Probe\n" + "-" * 54)
+            # refresh hostnames concurrently (only UP and stale)
+            up_devices = [ip for ip, up in zip(devices, statuses) if up]
+            if up_devices:
+                concurrent_hostname_refresh(up_devices)
+
+            # assemble hostnames from cache (UP) or 'unknown' (DOWN)
+            hostnames = {}
             for ip, up in zip(devices, statuses):
-                hn = hostnames.get(ip, "unknown")
-                print(f"{ip:<16}  {'UP  ' if up else 'DOWN'}  hostname: {hn}")
-            print("-" * 54)
+                if up:
+                    hn, ts = _hostname_cache.get(ip, ("unknown", 0))
+                    hostnames[ip] = hn
+                else:
+                    hostnames[ip] = "unknown"
 
-            draw_health_map(devices, statuses, hostnames, ax, t_now)
+            # console
+            os.system('cls' if platform.system().lower() == 'windows' else 'clear')
+            print("Network Device Health Probe\n" + "-" * 60)
+            for ip, up in zip(devices, statuses):
+                hn_display = clean_hostname(hostnames.get(ip, "unknown"))
+                print(f"{ip:<16}  {'UP  ' if up else 'DOWN'}  hostname: {hn_display}")
+            print("-" * 60)
 
-            # small pause—keeps UI smooth and blinking snappy
-            plt.pause(0.2)
+            # draw
+            draw_health_map(devices, statuses, hostnames, ax, blink_on=blink_on)
+
+            # keep UI responsive and blinking smooth
+            plt.pause(0.15)
 
     except KeyboardInterrupt:
         print("\n[✓] Monitoring stopped by user.")
