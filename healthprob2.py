@@ -22,20 +22,21 @@ SSH_TIMEOUT = 3.0
 HOSTNAME_REFRESH_SEC = 120
 
 # ---------- Visuals / Layout ----------
-RADIUS = 1.3                 # bigger circle so UP/DOWN fits cleanly
+RADIUS_UP = 1.3              # green circles
+RADIUS_DOWN = 1.5            # red circles (slightly bigger)
 LABEL_FS = 10
 STATUS_FS = 12
 COLS = 7
 
 # ---------- Blinking ----------
-BLINK_PERIOD_SEC = 1.0       # toggle every 1s
+BLINK_PERIOD_SEC = 0.5       # toggle every 1s
 DIM_ALPHA = 0.25
 FULL_ALPHA = 1.0
 
-# ---------- Domain suffixes to strip from hostnames (case-insensitive) ----------
+# ---------- Suffix cleanup ----------
 SUFFIXES = (".elements.local", ".intel.com", ".corp.nandps.com")
 
-# ---------- Caches ----------
+# ---------- Cache: ip -> (hostname, ts) ----------
 _hostname_cache: Dict[str, Tuple[str, float]] = {}
 
 # ---------- Helpers ----------
@@ -43,12 +44,31 @@ def clean_hostname(hn: str) -> str:
     if not hn:
         return "unknown"
     h = hn.strip()
-    h_lower = h.lower()
+    hl = h.lower()
     for sfx in SUFFIXES:
-        if h_lower.endswith(sfx):
-            h = h[: -(len(sfx))]
+        if hl.endswith(sfx):
+            h = h[:-(len(sfx))]
             break
     return h if h else "unknown"
+
+def wrap_text(s: str, width: int = 16) -> str:
+    """Soft wrap hostname for badge: prefer breaking on '-' or '.'; otherwise hard-wrap."""
+    if len(s) <= width:
+        return s
+    parts = []
+    buf = s
+    while len(buf) > width:
+        # look for a nearby break char within window
+        window = buf[:width]
+        cut = max(window.rfind('-'), window.rfind('.'))
+        if cut >= 8:  # don't make tiny first line
+            parts.append(buf[:cut])
+            buf = buf[cut+1:]
+        else:
+            parts.append(window)
+            buf = buf[width:]
+    parts.append(buf)
+    return "\n".join(parts)
 
 def ping_device(ip: str) -> bool:
     system = platform.system().lower()
@@ -78,7 +98,7 @@ def ssh_exec_once(ip: str, command: str) -> Tuple[bool, str]:
                 banner_timeout=SSH_TIMEOUT,
                 auth_timeout=SSH_TIMEOUT,
             )
-            stdin, stdout, stderr = client.exec_command(command, timeout=SSH_TIMEOUT)
+            _, stdout, _ = client.exec_command(command, timeout=SSH_TIMEOUT)
             out = stdout.read().decode(errors="ignore").strip()
             return True, out
         except (AuthenticationException, BadHostKeyException, SSHException,
@@ -123,18 +143,18 @@ def get_hostname_via_ssh(ip: str) -> str:
     return "unknown"
 
 def get_hostname_cached(ip: str, should_try_ssh: bool) -> str:
+    """Return cached hostname; if stale and device is UP, refresh via SSH."""
     now = time.time()
-    if ip in _hostname_cache:
-        hn, ts = _hostname_cache[ip]
-        if now - ts < HOSTNAME_REFRESH_SEC:
-            return hn
-
-    hn = "unknown"
+    if ip in _hostname_cache and now - _hostname_cache[ip][1] < HOSTNAME_REFRESH_SEC:
+        return _hostname_cache[ip][0]
     if should_try_ssh:
         hn = get_hostname_via_ssh(ip)
-
-    _hostname_cache[ip] = (hn, now)
-    return hn
+        _hostname_cache[ip] = (hn, now)
+        return hn
+    # Device is DOWN or we don't want SSH right now: return last known if any
+    if ip in _hostname_cache:
+        return _hostname_cache[ip][0]
+    return "unknown"
 
 def read_devices(file_path="devices.txt") -> List[str]:
     try:
@@ -163,42 +183,49 @@ def compute_grid_positions(n, cols, x_gap, y_gap):
     return positions, rows
 
 # ---------- Drawing ----------
-def draw_health_map(devices, statuses, hostnames, ax, blink_on: bool):
+def draw_health_map(devices: List[str], statuses: List[bool], hostnames: Dict[str, str],
+                    ax, blink_on: bool):
     ax.clear()
     ax.set_facecolor("black")
     ax.axis("off")
     ax.set_aspect("equal", adjustable="box")
 
-    # spacing based on cleaned hostname length + IP length
+    # spacing based on CLEANED & WRAPPED hostnames and IPs
     longest = 12
+    preview_labels = {}
     for ip in devices:
-        hn = clean_hostname(hostnames.get(ip, "unknown"))
-        longest = max(longest, len(hn), len(ip))
+        hn_clean = clean_hostname(hostnames.get(ip, "unknown"))
+        hn_wrapped = wrap_text(hn_clean, width=16)
+        preview_labels[ip] = f"{hn_wrapped}\n{ip}"
+        # approximate 'longest' using the longest line of wrapped label
+        longest_line = max(len(line) for line in hn_wrapped.splitlines())
+        longest = max(longest, longest_line, len(ip))
 
-    X_GAP_MIN = 3.8
-    X_GAP = max(X_GAP_MIN, 0.35 * longest + 1.6)
-    Y_GAP = 4.4
+    # wider gaps than before to avoid overlap
+    X_GAP_MIN = 4.2
+    X_GAP = max(X_GAP_MIN, 0.45 * longest + 1.8)  # increased scaling
+    Y_GAP = 5.0                                    # more vertical room
 
     positions, rows = compute_grid_positions(len(devices), COLS, X_GAP, Y_GAP)
 
     for (ip, up), (x, y) in zip(zip(devices, statuses), positions):
-        hn_clean = clean_hostname(hostnames.get(ip, "unknown"))
+        label_text = preview_labels[ip]
 
+        # blinking for DOWN: toggle alpha
         alpha = FULL_ALPHA if up else (FULL_ALPHA if blink_on else DIM_ALPHA)
-
         face_color = "green" if up else "red"
         status_text = "UP" if up else "DOWN"
         status_color = "white" if up else "yellow"
+        radius = RADIUS_UP if up else RADIUS_DOWN
 
-        circ = plt.Circle((x, y), RADIUS, facecolor=face_color, edgecolor="white",
+        circ = plt.Circle((x, y), radius, facecolor=face_color, edgecolor="white",
                           linewidth=1.8, antialiased=True, alpha=alpha)
         ax.add_patch(circ)
 
         ax.text(x, y, status_text, color=status_color, ha="center", va="center",
                 fontsize=STATUS_FS, fontweight="bold", alpha=alpha)
 
-        label_text = f"{hn_clean}\n{ip}"
-        ax.text(x, y - (RADIUS + 0.9), label_text,
+        ax.text(x, y - (radius + 1.0), label_text,
                 color="black", ha="center", va="center",
                 fontsize=LABEL_FS, fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="none", alpha=1.0))
@@ -206,17 +233,18 @@ def draw_health_map(devices, statuses, hostnames, ax, blink_on: bool):
     if devices:
         width = max(1, (COLS - 1)) * X_GAP
         height = max(1, (rows - 1)) * Y_GAP
-        pad_x = 2.0
-        pad_y = 2.0
+        pad_x = 2.5
+        pad_y = 2.5
+        max_radius = max(RADIUS_UP, RADIUS_DOWN)
         ax.set_xlim(-width/2 - pad_x, width/2 + pad_x)
-        ax.set_ylim(-height/2 - (RADIUS + 1.8) - pad_y, height/2 + (RADIUS + 1.8) + pad_y)
+        ax.set_ylim(-height/2 - (max_radius + 2.0) - pad_y, height/2 + (max_radius + 2.0) + pad_y)
 
     ax.set_title("Live Network Device Health", color="white", fontsize=16, fontweight="bold", pad=16)
 
-# ---------- Concurrency Wrappers ----------
+# ---------- Concurrency ----------
 def concurrent_ping(devices: List[str]) -> Dict[str, bool]:
     results: Dict[str, bool] = {}
-    with ThreadPoolExecutor(max_workers=min(32, len(devices) or 1)) as ex:
+    with ThreadPoolExecutor(max_workers=min(32, max(1, len(devices)))) as ex:
         fut_map = {ex.submit(ping_device, ip): ip for ip in devices}
         for fut in as_completed(fut_map):
             ip = fut_map[fut]
@@ -226,37 +254,21 @@ def concurrent_ping(devices: List[str]) -> Dict[str, bool]:
                 results[ip] = False
     return results
 
-def concurrent_hostname_refresh(devices_up: List[str]) -> Dict[str, str]:
-    """
-    Refresh hostname cache concurrently only for devices whose cache is stale.
-    Returns dict[ip] -> hostname (from cache after refresh).
-    """
+def concurrent_hostname_refresh(devices_up: List[str]):
+    """Refresh hostnames concurrently for UP devices whose cache is stale."""
     now = time.time()
     to_refresh = []
     for ip in devices_up:
         if ip not in _hostname_cache or now - _hostname_cache[ip][1] >= HOSTNAME_REFRESH_SEC:
             to_refresh.append(ip)
 
-    # fetch in parallel
     def fetch(ip):
         hn = get_hostname_via_ssh(ip)
         _hostname_cache[ip] = (hn, time.time())
-        return ip, hn
 
-    with ThreadPoolExecutor(max_workers=min(16, len(to_refresh) or 1)) as ex:
-        futs = [ex.submit(fetch, ip) for ip in to_refresh]
-        for fut in as_completed(futs):
-            try:
-                ip, _ = fut.result()
-            except Exception:
-                pass
-
-    # build final map from cache
-    out = {}
-    for ip in devices_up:
-        hn, ts = _hostname_cache.get(ip, ("unknown", now))
-        out[ip] = hn
-    return out
+    if to_refresh:
+        with ThreadPoolExecutor(max_workers=min(16, len(to_refresh))) as ex:
+            list(ex.map(fetch, to_refresh))
 
 # ---------- Main ----------
 def main():
@@ -265,56 +277,45 @@ def main():
         print("[!] No devices found in devices.txt.")
         return
 
-    fig, ax = plt.subplots(figsize=(16, 9), dpi=110)
+    fig, ax = plt.subplots(figsize=(18, 10), dpi=110)  # a bit larger canvas
     plt.ion()
     plt.show()
 
-    print("[*] Live monitoring (Ctrl+C to stop). Blinking = DOWN nodes.")
-    print("[i] Hostnames pulled over SSH for UP nodes; cache refresh every "
-          f"{HOSTNAME_REFRESH_SEC}s.")
+    print("[*] Live monitoring (Ctrl+C to stop). DOWN nodes blink; cached hostnames persist while DOWN.")
 
     last_blink_toggle = time.time()
     blink_on = True
 
     try:
         while True:
-            # toggle blink state every BLINK_PERIOD_SEC
             now = time.time()
             if now - last_blink_toggle >= BLINK_PERIOD_SEC:
                 blink_on = not blink_on
                 last_blink_toggle = now
 
-            # ping concurrently
             ping_map = concurrent_ping(devices)
             statuses = [ping_map.get(ip, False) for ip in devices]
 
-            # refresh hostnames concurrently (only UP and stale)
+            # refresh hostnames only for UP (concurrent), cache retains last-known for DOWN
             up_devices = [ip for ip, up in zip(devices, statuses) if up]
             if up_devices:
                 concurrent_hostname_refresh(up_devices)
 
-            # assemble hostnames from cache (UP) or 'unknown' (DOWN)
+            # Gather hostnames for plotting: keep last-known for DOWN
             hostnames = {}
             for ip, up in zip(devices, statuses):
-                if up:
-                    hn, ts = _hostname_cache.get(ip, ("unknown", 0))
-                    hostnames[ip] = hn
-                else:
-                    hostnames[ip] = "unknown"
+                hostnames[ip] = get_hostname_cached(ip, should_try_ssh=up)
 
             # console
             os.system('cls' if platform.system().lower() == 'windows' else 'clear')
-            print("Network Device Health Probe\n" + "-" * 60)
+            print("Network Device Health Probe\n" + "-" * 64)
             for ip, up in zip(devices, statuses):
                 hn_display = clean_hostname(hostnames.get(ip, "unknown"))
                 print(f"{ip:<16}  {'UP  ' if up else 'DOWN'}  hostname: {hn_display}")
-            print("-" * 60)
+            print("-" * 64)
 
-            # draw
             draw_health_map(devices, statuses, hostnames, ax, blink_on=blink_on)
-
-            # keep UI responsive and blinking smooth
-            plt.pause(0.15)
+            plt.pause(0.12)  # fast enough for smooth blink & UI
 
     except KeyboardInterrupt:
         print("\n[✓] Monitoring stopped by user.")
